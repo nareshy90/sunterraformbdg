@@ -5,7 +5,6 @@ import logging
 import os
 import tempfile
 import time
-from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from urllib.parse import unquote_plus
 
@@ -28,7 +27,10 @@ def _get_secret(secret_arn: str) -> str:
 
 
 def _decrypt_ansible_vault(cipher_text: str, vault_password: str) -> str:
-    """Decrypt ansible-vault encrypted text in-memory."""
+    """
+    Decrypt ansible-vault encrypted text in-memory.
+    Requires ansible-core dependency packaged with the Lambda artifact.
+    """
     from ansible.parsing.vault import VaultLib, VaultSecret
 
     vault = VaultLib([("default", VaultSecret(vault_password.encode("utf-8")))])
@@ -43,22 +45,9 @@ def _load_cloudtrail_records(bucket: str, key: str) -> List[Dict]:
     return document.get("Records", [])
 
 
-def _event_time_to_ns(record: Dict) -> str:
-    event_time = record.get("eventTime")
-    if not isinstance(event_time, str):
-        return str(int(time.time() * 1_000_000_000))
-
-    try:
-        dt = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return str(int(dt.timestamp() * 1_000_000_000))
-    except ValueError:
-        return str(int(time.time() * 1_000_000_000))
-
-
 def _to_loki_streams(records: List[Dict], environment_id: str) -> Dict:
     streams = []
+    now_ns = str(int(time.time() * 1_000_000_000))
     for record in records:
         labels = {
             "job": "cloudtrail",
@@ -68,12 +57,7 @@ def _to_loki_streams(records: List[Dict], environment_id: str) -> Dict:
             "event_name": str(record.get("eventName", "unknown")),
             "aws_region": str(record.get("awsRegion", "unknown")),
         }
-        streams.append(
-            {
-                "stream": labels,
-                "values": [[_event_time_to_ns(record), json.dumps(record, separators=(",", ":"))]],
-            }
-        )
+        streams.append({"stream": labels, "values": [[now_ns, json.dumps(record, separators=(",", ":"))]]})
     return {"streams": streams}
 
 
@@ -121,8 +105,6 @@ def _post_to_loki(
 
 
 def lambda_handler(event, context):
-    del context
-
     environment_id = os.environ["ENVIRONMENT_ID"]
     loki_url = os.environ["LOKI_URL"]
 

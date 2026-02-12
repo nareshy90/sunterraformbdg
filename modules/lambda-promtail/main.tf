@@ -1,7 +1,7 @@
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_dir  = var.source_dir
-  output_path = "${path.module}/${var.name_prefix}.zip"
+  output_path = "${path.module}/build/${var.name_prefix}.zip"
 }
 
 resource "aws_cloudwatch_log_group" "this" {

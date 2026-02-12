@@ -42,7 +42,6 @@ class TestLambdaPromtail(unittest.TestCase):
                 "eventSource": "ec2.amazonaws.com",
                 "eventName": "RunInstances",
                 "awsRegion": "us-east-1",
-                "eventTime": "2025-02-03T12:34:56Z",
             }
         ]
         payload = handler._to_loki_streams(records, "1517")
@@ -51,7 +50,6 @@ class TestLambdaPromtail(unittest.TestCase):
         stream = payload["streams"][0]["stream"]
         self.assertEqual(stream["environment"], "1517")
         self.assertEqual(stream["aws_account_id"], "123456789012")
-        self.assertEqual(payload["streams"][0]["values"][0][0], "1738586096000000000")
 
     def test_load_cloudtrail_records_from_gzip(self):
         body = {"Records": [{"eventName": "ConsoleLogin"}]}

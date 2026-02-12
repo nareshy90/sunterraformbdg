@@ -5,7 +5,7 @@ import logging
 import os
 import tempfile
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 from urllib.parse import unquote_plus
 
 import boto3
@@ -22,7 +22,7 @@ S3_CLIENT = boto3.client("s3")
 def _get_secret(secret_arn: str) -> str:
     response = SECRETS_CLIENT.get_secret_value(SecretId=secret_arn)
     if "SecretString" in response:
-      return response["SecretString"]
+        return response["SecretString"]
     return base64.b64decode(response["SecretBinary"]).decode("utf-8")
 
 
@@ -47,6 +47,7 @@ def _load_cloudtrail_records(bucket: str, key: str) -> List[Dict]:
 
 def _to_loki_streams(records: List[Dict], environment_id: str) -> Dict:
     streams = []
+    now_ns = str(int(time.time() * 1_000_000_000))
     for record in records:
         labels = {
             "job": "cloudtrail",
@@ -56,25 +57,49 @@ def _to_loki_streams(records: List[Dict], environment_id: str) -> Dict:
             "event_name": str(record.get("eventName", "unknown")),
             "aws_region": str(record.get("awsRegion", "unknown")),
         }
-        timestamp_ns = str(int(time.time() * 1_000_000_000))
-        streams.append({"stream": labels, "values": [[timestamp_ns, json.dumps(record, separators=(",", ":"))]]})
+        streams.append({"stream": labels, "values": [[now_ns, json.dumps(record, separators=(",", ":"))]]})
     return {"streams": streams}
 
 
-def _post_to_loki(loki_url: str, username: str, password: str, ca_cert_pem: str, payload: Dict) -> None:
+def _post_to_loki(
+    loki_url: str,
+    username: str,
+    password: str,
+    ca_cert_pem: str,
+    payload: Dict,
+    max_attempts: int = 3,
+) -> None:
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as cert_file:
         cert_file.write(ca_cert_pem)
         cert_path = cert_file.name
 
     try:
-        response = requests.post(
-            f"{loki_url.rstrip('/')}/loki/api/v1/push",
-            auth=HTTPBasicAuth(username, password),
-            json=payload,
-            verify=cert_path,
-            timeout=(3.05, 15),
-        )
-        response.raise_for_status()
+        backoff_seconds = 1
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(
+                    f"{loki_url.rstrip('/')}/loki/api/v1/push",
+                    auth=HTTPBasicAuth(username, password),
+                    json=payload,
+                    verify=cert_path,
+                    timeout=(3.05, 15),
+                )
+                response.raise_for_status()
+                return
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt == max_attempts:
+                    break
+                LOGGER.warning(
+                    "Loki push failed, retrying",
+                    extra={"attempt": attempt, "next_backoff_seconds": backoff_seconds},
+                )
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+
+        raise RuntimeError("Failed to push log payload to Loki") from last_exc
     finally:
         os.remove(cert_path)
 
@@ -107,10 +132,16 @@ def lambda_handler(event, context):
             if payload["streams"]:
                 _post_to_loki(loki_url, loki_username, loki_password, ca_cert_pem, payload)
             successful += 1
-            LOGGER.info("Processed CloudTrail object", extra={"bucket": bucket, "key": key, "record_count": len(cloudtrail_records)})
-        except Exception as exc:
+            LOGGER.info(
+                "Processed CloudTrail object",
+                extra={"bucket": bucket, "key": key, "record_count": len(cloudtrail_records)},
+            )
+        except Exception as exc:  # noqa: BLE001
             failed += 1
-            LOGGER.exception("Failed to process CloudTrail object", extra={"bucket": bucket, "key": key, "error_type": type(exc).__name__})
+            LOGGER.exception(
+                "Failed to process CloudTrail object",
+                extra={"bucket": bucket, "key": key, "error_type": type(exc).__name__},
+            )
 
     return {
         "processed": successful,
